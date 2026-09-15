@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Models (large binary files — document how to obtain them instead)
+models/yolo/*.pt
+
+# Data (runtime-generated, not source)
+data/input/videos/*
+data/input/streams/*
+data/output/annotated/*
+data/output/processed/*
+data/evidence/images/*
+data/evidence/videos/*
+data/database/*.db
+!data/**/.gitkeep
+
+# Logs
+logs/*.log*
+!logs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+

@@ -1,0 +1,122 @@
+# config/thresholds.yaml
+#
+# Fine-grained, human-tunable thresholds for the accident-detection
+# pipeline. These are loaded (Phase 6/7) by the collision and accident
+# decision modules via config/threshold_loader.py, so behaviour can be
+# tuned WITHOUT touching code.
+#
+# Top-level "knob" values that are also commonly overridden via
+# environment variables live in config/settings.py — this file holds
+# the more detailed, per-signal weighting used by the scoring logic
+# introduced in later phases.
+
+collision:
+  # Pixel distance below which two tracked objects are considered
+  # "spatially interacting" (bounding-box overlap is checked separately).
+  min_center_distance_px: 40.0
+  # Minimum IoU between two bounding boxes to count as overlap.
+  bbox_overlap_iou: 0.05
+  # Weight of each signal in the composite collision score (Phase 6).
+  weights:
+    spatial_interaction: 0.35
+    trajectory_change: 0.25
+    motion_change: 0.20
+    post_interaction_stopping: 0.20
+  # How many frames after the last detected spatial contact a pair is
+  # still treated as "in an active interaction window" — keeps
+  # evaluating indicators #6/#7 (abnormal movement / stopping AFTER
+  # contact) for a few frames even once the boxes separate again,
+  # since a real collision's aftermath naturally lags the contact
+  # moment by a frame or two.
+  post_interaction_window_frames: 10
+  # Minimum closing speed (px/frame the pair's center distance is
+  # SHRINKING) treated as "approaching each other", used by Phase 7's
+  # AccidentScorer to distinguish a genuine collision course from
+  # ordinary traffic that happens to be pixel-close (e.g. two vehicles
+  # traveling in parallel in adjacent lanes at a constant safe
+  # distance — closing_speed ~= 0 in that case, so it earns no boost).
+  # Added after real-footage testing showed adjacent-lane traffic
+  # being flagged as ACCIDENT CONFIRMED purely from sustained
+  # proximity with no real approach happening.
+  closing_speed_threshold_px_per_frame: 3.0
+
+motion:
+  # Minimum relative pixel speed (px/frame) at or below which an object
+  # is considered "stationary". This compares against the pixel-space
+  # speed metric only — never a real-world speed.
+  stationary_speed_px: 2.0
+  # Fractional drop in speed (segment-to-segment) considered a "sudden
+  # deceleration", e.g. 0.5 = speed dropped by at least half.
+  sudden_deceleration_ratio: 0.5
+  # Degrees of heading change between consecutive movement segments
+  # considered a "sudden direction change".
+  sudden_direction_change_deg: 45.0
+  # How many of the most recent stored position samples MotionAnalyzer
+  # (Phase 5) uses for its rolling calculations. Must be <= the hard
+  # storage cap in settings.TRACK_HISTORY_LENGTH (Phase 4) — it is
+  # clamped to that value if set higher.
+  history_length: 30
+
+accident:
+  # A frame's instantaneous accident_probability at or above this
+  # value opens (or keeps open) a "possible incident" window for that
+  # pair — the first step of the Phase 7 temporal-verification FSM.
+  possible_incident_score: 0.5
+  # The instantaneous score must reach this level for a persistence
+  # streak to actually confirm as ACCIDENT (not just possible_incident_score) —
+  # keeps a long streak of only mildly-elevated scores from confirming.
+  accident_score: 0.75
+  # Number of CONSECUTIVE qualifying frames (score >= possible_incident_score)
+  # required before a "possible incident" is confirmed as an accident.
+  # This is what makes "do not classify an accident from a single frame"
+  # actually true: one high frame alone (streak=1) can never reach this.
+  temporal_verification_frames: 15
+  # How the three evidence types are weighted into one instantaneous
+  # per-frame accident_probability, BEFORE temporal verification.
+  # Reused/derived from Phase 6's CollisionScore fields:
+  #   collision  <- spatial_interaction_score, floored to at least
+  #                 active_contact_floor while contact is currently
+  #                 active (being in contact at all is itself moderate
+  #                 evidence, regardless of exact overlap depth)
+  #   motion     <- max(motion_change_score, post_interaction_stopping_score)
+  #                 (max, not average: a sudden-deceleration SPIKE at
+  #                 the moment of impact and SUSTAINED stillness
+  #                 afterward are two different time windows of the
+  #                 same evidence — averaging them dilutes both, which
+  #                 made even genuine sustained collisions decay below
+  #                 possible_incident_score within a few frames during
+  #                 testing, never reaching temporal_verification_frames)
+  #   trajectory <- trajectory_change_score
+  # Must sum to 1.0.
+  evidence_weights:
+    collision: 0.40
+    motion: 0.35
+    trajectory: 0.25
+  # Floor applied to collision_evidence while a pair is in ACTIVE
+  # spatial contact this exact frame (CollisionScore.is_active_spatial_contact),
+  # regardless of how deep the overlap/closeness actually is. Being in
+  # contact at all is itself meaningful, persistent evidence.
+  active_contact_floor: 0.5
+  # Weighting for SINGLE-OBJECT anomaly evidence (an object showing
+  # extreme, simultaneous sudden-deceleration + sudden-direction-change
+  # with no interacting partner at all — e.g. a motorcycle losing
+  # control and going down with no other vehicle touching it). Added
+  # after real-footage testing showed this exact scenario going
+  # completely undetected: the pairwise-only formula above has no
+  # signal to work with when there is no second object. Deliberately
+  # has no "collision" component (there is no second object to be in
+  # contact with), so these two must sum to 1.0 on their own. This is
+  # a genuine scope EXTENSION beyond the original Phase 6/7 spec (which
+  # only describes pairwise collision evidence) — not a guaranteed fix:
+  # if tracking itself breaks during a violent fall (occlusion, motion
+  # blur), there is no motion history left to evaluate at all, and no
+  # scoring change can recover that.
+  single_object_evidence_weights:
+    motion: 0.60
+    trajectory: 0.40
+
+evidence:
+  # Seconds of rolling buffer kept before/after a confirmed accident
+  # when assembling the incident clip (Phase 9).
+  pre_event_seconds: 5
+  post_event_seconds: 5
