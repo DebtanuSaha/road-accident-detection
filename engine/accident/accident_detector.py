@@ -9,23 +9,30 @@ so the rest of the pipeline (scripts, and eventually the FastAPI
 backend) has a single entry point rather than needing to know about
 both sub-modules.
 
-Handles TWO independent evaluation pathways, both routed through the
-same `TemporalVerifier` FSM (so both get the identical no-single-frame-
-trigger persistence protection):
+Handles TWO independent evaluation pathways, each with its OWN
+`TemporalVerifier` instance (same FSM code, different thresholds — see
+`temporal_verifier.py`'s override parameters):
 
   1. PAIRWISE — from Phase 6's `CollisionScore`s, as originally
-     designed: two tracked objects interacting.
+     designed: two tracked objects interacting. Uses the shared
+     pairwise thresholds (`accident.possible_incident_score` /
+     `accident.accident_score`).
   2. SINGLE-OBJECT anomaly — added after real-footage testing showed a
      real gap: a vehicle (e.g. a motorcycle) losing control and
      falling, with NO second object involved at all, is invisible to
      the pairwise pathway by construction. Uses a self-paired key
-     `(track_id, track_id)` to reuse the exact same FSM code rather
-     than duplicating persistence logic. Only evaluated for objects
-     whose current `MotionState` already shows a sudden-deceleration
-     or sudden-direction-change flag — calm objects are skipped
-     entirely, which has no effect on confirmation behavior (a skipped
-     object's streak would reset to 0 anyway) but avoids needless
-     per-frame work across every idle object in a busy scene.
+     `(track_id, track_id)` and its OWN, much stricter thresholds
+     (`accident.single_object_possible_incident_score` /
+     `single_object_accident_score`) via a SEPARATE `TemporalVerifier`
+     instance — an earlier version of this code mistakenly ran the
+     single-object evidence through the pairwise verifier/thresholds,
+     which (combined with individually-common "sudden" motion flags)
+     flagged ordinary braking/turning across nearly every vehicle in a
+     busy scene. Only evaluated for objects whose current `MotionState`
+     already shows a sudden-deceleration or sudden-direction-change
+     flag — calm objects are skipped entirely, which has no effect on
+     confirmation behavior (a skipped object's streak would reset to 0
+     anyway) but avoids needless per-frame work.
 
 Produces `AccidentAssessment` per currently-scored pair (or single
 object): the instantaneous evidence/score/tier for this frame, PLUS
@@ -33,7 +40,10 @@ the temporal verification state (consecutive streak, and whether this
 pair/object has been CONFIRMED as an accident). Only `confirmed=True`
 represents an actual decision this system stands behind — everything
 else is provisional, single-frame information kept for visibility/
-debugging.
+debugging (and, per the real-footage feedback that drove this rewrite,
+callers should generally avoid DISPLAYING unconfirmed single-object
+assessments at all — see scripts/run_*.py's `is_single_object`
+handling, which now only draws confirmed loss-of-control events).
 """
 
 from __future__ import annotations
@@ -100,15 +110,23 @@ class AccidentDetector:
     """
     Usage (call once per frame, after Phase 6's CollisionScorer):
         detector = AccidentDetector(settings)
-        assessments = detector.update(collision_scores, frame_index, timestamp_ms)
+        assessments = detector.update(
+            collision_scores, frame_index, timestamp_ms,
+            motion_states=motion_states, tracked_objects=tracked_objects,
+        )
         confirmed = [a for a in assessments if a.confirmed]
     """
 
     def __init__(self, cfg: Settings = default_settings):
         self._cfg = cfg
         self._scorer = AccidentScorer(cfg)
-        self._verifier = TemporalVerifier(cfg)
-        self._newly_confirmed_pairs: set = set()
+        self._verifier = TemporalVerifier(cfg, label="pairwise")
+        self._single_object_verifier = TemporalVerifier(
+            cfg,
+            possible_incident_score=self._scorer.single_object_possible_incident_score,
+            accident_score=self._scorer.single_object_accident_score,
+            label="single-object",
+        )
 
     def update(
         self,
@@ -126,6 +144,7 @@ class AccidentDetector:
         """
         assessments: List[AccidentAssessment] = []
         active_pair_keys = set()
+        active_single_object_keys = set()
 
         for cs in collision_scores:
             key = _pair_key(cs.track_id_a, cs.track_id_b)
@@ -174,16 +193,17 @@ class AccidentDetector:
                     continue  # calm object — skipping has no effect on FSM outcome, see docstring
 
                 key = _pair_key(obj.track_id, obj.track_id)  # self-paired key
-                active_pair_keys.add(key)
+                active_single_object_keys.add(key)
 
                 evidence = self._scorer.compute_single_object_evidence(state)
                 score = self._scorer.compute_single_object_score(evidence)
-                instantaneous_state = self._scorer.classify(score)
+                instantaneous_state = self._scorer.classify_single_object(score)
 
                 was_confirmed_before = (
-                    self._verifier.get_state(key).confirmed if self._verifier.get_state(key) else False
+                    self._single_object_verifier.get_state(key).confirmed
+                    if self._single_object_verifier.get_state(key) else False
                 )
-                pair_state = self._verifier.update(key, score, frame_index)
+                pair_state = self._single_object_verifier.update(key, score, frame_index)
 
                 if pair_state.confirmed and not was_confirmed_before:
                     logger.info(
@@ -211,7 +231,9 @@ class AccidentDetector:
                 )
 
         self._verifier.prune(active_pair_keys)
+        self._single_object_verifier.prune(active_single_object_keys)
         return assessments
 
     def reset(self) -> None:
         self._verifier.reset()
+        self._single_object_verifier.reset()

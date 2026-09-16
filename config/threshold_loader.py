@@ -55,4 +55,28 @@ def load_thresholds(path: Path = THRESHOLDS_PATH) -> Dict[str, Any]:
     if missing:
         raise ThresholdConfigError(f"Threshold config missing sections: {sorted(missing)}")
 
+    _validate_cross_section_constraints(data, path)
+
     return data
+
+
+def _validate_cross_section_constraints(data: Dict[str, Any], path: Path) -> None:
+    """
+    Check invariants that span sections, so a mis-tune fails loudly at
+    startup rather than silently disabling detection at runtime.
+    """
+    window = data["collision"].get("post_interaction_window_frames")
+    streak = data["accident"].get("temporal_verification_frames")
+
+    if window is not None and streak is not None and window < streak:
+        # Found the hard way during real-footage debugging: a pair stops
+        # being scored once its post-interaction window expires, so if
+        # that window is shorter than the confirmation streak, a real
+        # collision's streak gets cut off before it can ever complete.
+        raise ThresholdConfigError(
+            f"Invalid threshold config at {path}: "
+            f"collision.post_interaction_window_frames ({window}) must be >= "
+            f"accident.temporal_verification_frames ({streak}), otherwise a pair is "
+            "evicted from scoring before its confirmation streak can complete and "
+            "real collisions can never be confirmed."
+        )

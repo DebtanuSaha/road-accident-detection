@@ -3,8 +3,8 @@ engine/collision/collision_detector.py
 
 Phase 6 — Collision Detection: spatial interaction rules.
 
-Pure, stateless geometric checks between pairs of currently tracked
-objects for the CURRENT frame only:
+Geometric checks between pairs of currently tracked objects for the
+CURRENT frame, with short-lived contact memory for hysteresis:
   1. Bounding-box overlap/intersection (IoU)
   2. Very small distance between tracked objects (center distance)
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import List, Sequence
+from typing import List, Sequence, Set, Tuple
 
 from config.settings import Settings
 from config.settings import settings as default_settings
@@ -68,6 +68,7 @@ class SpatialInteraction:
     center_distance_px: float
     is_overlapping: bool
     is_close: bool
+    is_sustained_contact: bool
     spatial_score: float  # combined [0,1] strength: max(IoU, closeness fraction)
 
     @property
@@ -80,6 +81,7 @@ class SpatialInteraction:
             "iou": round(self.iou, 4),
             "center_distance_px": round(self.center_distance_px, 2),
             "is_overlapping": self.is_overlapping,
+            "is_sustained_contact": self.is_sustained_contact,
             "is_close": self.is_close,
             "spatial_score": round(self.spatial_score, 4),
         }
@@ -87,8 +89,9 @@ class SpatialInteraction:
 
 class CollisionDetector:
     """
-    Stateless, per-frame spatial interaction checks across all pairs of
-    currently active tracked objects.
+    Per-frame spatial interaction checks across all pairs of currently
+    active tracked objects, retaining genuinely overlapping pairs for
+    hysteresis across the collision aftermath.
     """
 
     def __init__(self, cfg: Settings = default_settings):
@@ -96,6 +99,9 @@ class CollisionDetector:
         collision_cfg = load_thresholds()["collision"]
         self._min_center_distance_px: float = collision_cfg["min_center_distance_px"]
         self._bbox_overlap_iou: float = collision_cfg["bbox_overlap_iou"]
+        self._sustain_bbox_overlap_iou: float = collision_cfg["sustain_bbox_overlap_iou"]
+        self._sustain_min_center_distance_px: float = collision_cfg["sustain_min_center_distance_px"]
+        self._contact_pairs: Set[Tuple[int, int]] = set()
         logger.info(
             "CollisionDetector initialized: min_center_distance_px=%.1f bbox_overlap_iou=%.2f",
             self._min_center_distance_px, self._bbox_overlap_iou,
@@ -111,16 +117,29 @@ class CollisionDetector:
         interacting pair every frame.
         """
         active = [t for t in tracked_objects if t.is_active]
+        active_ids = {t.track_id for t in active}
+        self._contact_pairs.intersection_update(
+            pair for pair in self._contact_pairs if pair[0] in active_ids and pair[1] in active_ids
+        )
         interactions: List[SpatialInteraction] = []
 
         for a, b in combinations(active, 2):
+            pair_key = (min(a.track_id, b.track_id), max(a.track_id, b.track_id))
             iou = compute_iou(a.bbox, b.bbox)
             distance = compute_center_distance(a.bbox, b.bbox)
             is_overlapping = iou >= self._bbox_overlap_iou
             is_close = distance <= self._min_center_distance_px
+            is_sustained_contact = pair_key in self._contact_pairs and (
+                iou >= self._sustain_bbox_overlap_iou
+                or distance <= self._sustain_min_center_distance_px
+            )
 
-            if not (is_overlapping or is_close):
+            if not (is_overlapping or is_close or is_sustained_contact):
+                self._contact_pairs.discard(pair_key)
                 continue
+
+            if is_overlapping:
+                self._contact_pairs.add(pair_key)
 
             closeness = 0.0
             if self._min_center_distance_px > 0:
@@ -135,6 +154,7 @@ class CollisionDetector:
                     center_distance_px=distance,
                     is_overlapping=is_overlapping,
                     is_close=is_close,
+                    is_sustained_contact=is_sustained_contact,
                     spatial_score=spatial_score,
                 )
             )

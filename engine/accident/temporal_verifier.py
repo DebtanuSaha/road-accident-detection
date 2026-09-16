@@ -79,19 +79,41 @@ class TemporalVerifier:
         verifier.prune(current_frame_pair_keys)   # drop pairs no longer being scored
     """
 
-    def __init__(self, cfg: Settings = default_settings):
+    def __init__(
+        self,
+        cfg: Settings = default_settings,
+        possible_incident_score: Optional[float] = None,
+        accident_score: Optional[float] = None,
+        label: str = "pairwise",
+    ):
+        """
+        `possible_incident_score` / `accident_score` override the
+        shared pairwise defaults from thresholds.yaml when provided —
+        used by `AccidentDetector` to run a second, stricter instance
+        of this exact FSM for the single-object pathway (see
+        `accident_detector.py`), so both pathways get identical
+        persistence protection without duplicating this logic. `label`
+        is purely for clearer log lines when more than one instance is
+        running side by side.
+        """
         self._cfg = cfg
+        self._label = label
         accident_cfg = load_thresholds()["accident"]
-        self._possible_incident_score: float = accident_cfg["possible_incident_score"]
-        self._accident_score: float = accident_cfg["accident_score"]
+        self._possible_incident_score: float = (
+            possible_incident_score if possible_incident_score is not None else accident_cfg["possible_incident_score"]
+        )
+        self._accident_score: float = (
+            accident_score if accident_score is not None else accident_cfg["accident_score"]
+        )
         self._temporal_verification_frames: int = accident_cfg["temporal_verification_frames"]
 
         self._pairs: Dict[PairKey, PairVerificationState] = {}
 
         logger.info(
-            "TemporalVerifier initialized: temporal_verification_frames=%d "
+            "TemporalVerifier[%s] initialized: temporal_verification_frames=%d "
             "possible_incident_score=%.2f accident_score=%.2f",
-            self._temporal_verification_frames, self._possible_incident_score, self._accident_score,
+            self._label, self._temporal_verification_frames,
+            self._possible_incident_score, self._accident_score,
         )
 
     def update(self, pair_key: PairKey, instantaneous_score: float, frame_index: int) -> PairVerificationState:
@@ -116,8 +138,8 @@ class TemporalVerifier:
             if pair_state.state == AccidentState.NORMAL:
                 pair_state.state = AccidentState.POSSIBLE_INCIDENT
                 logger.info(
-                    "Potential accident opened: pair=%s frame=%d score=%.3f",
-                    pair_key, frame_index, instantaneous_score,
+                    "Potential accident opened [%s]: pair=%s frame=%d score=%.3f",
+                    self._label, pair_key, frame_index, instantaneous_score,
                 )
 
             if (
@@ -128,8 +150,8 @@ class TemporalVerifier:
                 pair_state.confirmed = True
                 pair_state.confirmed_at_frame = frame_index
                 logger.info(
-                    "ACCIDENT CONFIRMED: pair=%s frame=%d streak=%d frames, last_score=%.3f",
-                    pair_key, frame_index, pair_state.consecutive_qualifying_frames, instantaneous_score,
+                    "ACCIDENT CONFIRMED [%s]: pair=%s frame=%d streak=%d frames, last_score=%.3f",
+                    self._label, pair_key, frame_index, pair_state.consecutive_qualifying_frames, instantaneous_score,
                 )
         else:
             if pair_state.consecutive_qualifying_frames > 0:

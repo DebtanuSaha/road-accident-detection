@@ -15,7 +15,27 @@ collision:
   # "spatially interacting" (bounding-box overlap is checked separately).
   min_center_distance_px: 40.0
   # Minimum IoU between two bounding boxes to count as overlap.
-  bbox_overlap_iou: 0.05
+  # Raised from an original 0.05 after real-footage testing: at typical
+  # monocular CCTV angles, vehicles in adjacent lanes routinely show a
+  # SLIGHT bbox overlap purely from camera perspective (near/far lane
+  # compression), even with no real contact. 0.05 treated any pixel
+  # graze as "real contact"; 0.15 requires a genuinely substantial
+  # overlap before it's trusted as such.
+  bbox_overlap_iou: 0.15
+  # HYSTERESIS: once a pair IS already interacting, it stays interacting
+  # until it falls below these (looser) values, rather than the stricter
+  # entry thresholds above. Without this, a real collision's aftermath —
+  # two vehicles resting against each other, gradually settling — drops
+  # below the strict entry IoU and the pair stops being scored entirely,
+  # cutting off its confirmation streak. Real-footage debugging showed
+  # exactly that: a genuine collision settled at IoU ~0.13 / distance
+  # ~52px, just outside the entry thresholds (0.15 / 40px), so scoring
+  # stopped at 7 consecutive qualifying frames and could never reach the
+  # 15 needed. Asymmetric entry/exit thresholds are the standard fix:
+  # hard to START an interaction (rejects perspective artifacts), easy
+  # to KEEP one (preserves genuine aftermath).
+  sustain_bbox_overlap_iou: 0.05
+  sustain_min_center_distance_px: 80.0
   # Weight of each signal in the composite collision score (Phase 6).
   weights:
     spatial_interaction: 0.35
@@ -25,20 +45,38 @@ collision:
   # How many frames after the last detected spatial contact a pair is
   # still treated as "in an active interaction window" — keeps
   # evaluating indicators #6/#7 (abnormal movement / stopping AFTER
-  # contact) for a few frames even once the boxes separate again,
-  # since a real collision's aftermath naturally lags the contact
-  # moment by a frame or two.
-  post_interaction_window_frames: 10
-  # Minimum closing speed (px/frame the pair's center distance is
-  # SHRINKING) treated as "approaching each other", used by Phase 7's
-  # AccidentScorer to distinguish a genuine collision course from
-  # ordinary traffic that happens to be pixel-close (e.g. two vehicles
-  # traveling in parallel in adjacent lanes at a constant safe
-  # distance — closing_speed ~= 0 in that case, so it earns no boost).
-  # Added after real-footage testing showed adjacent-lane traffic
-  # being flagged as ACCIDENT CONFIRMED purely from sustained
-  # proximity with no real approach happening.
-  closing_speed_threshold_px_per_frame: 3.0
+  # contact) for a while even once the boxes separate again, since a
+  # real collision's aftermath naturally lags the contact moment.
+  #
+  # MUST be >= accident.temporal_verification_frames, otherwise a pair
+  # can be evicted from scoring BEFORE its confirmation streak has had
+  # time to complete — making a whole class of real collisions
+  # structurally unconfirmable. Real-footage debugging hit exactly
+  # this: a genuine collision scored 0.80 (well above the 0.75 bar) and
+  # held a qualifying streak for 7 consecutive frames, then the pair
+  # was evicted at the old 10-frame window and the streak was lost,
+  # so it never confirmed at the moment of impact — only much later,
+  # via an entirely separate pathway, once traffic had stopped. Set
+  # comfortably above the 15-frame requirement so the aftermath window
+  # always outlasts the streak.
+  post_interaction_window_frames: 25
+  # How many CONSECUTIVE frames a pair must show real bbox overlap
+  # (bbox_overlap_iou or higher) before Phase 7's AccidentScorer trusts
+  # it as genuine contact (vs. a single-frame perspective glitch from
+  # camera angle / near-far lane compression). Added after real-footage
+  # testing kept showing a false ACCIDENT CONFIRMED on ordinary
+  # adjacent-lane traffic even after the IoU threshold was raised —
+  # a one-frame overlap blip was still enough to open the floor.
+  min_overlap_streak_frames: 3
+  # Minimum SMOOTHED closing speed (px/frame the pair's center distance
+  # is SHRINKING, exponentially averaged across frames to reject
+  # tracking jitter — see engine/collision/collision_scorer.py) treated
+  # as "approaching each other". Two vehicles traveling in parallel at
+  # a constant safe distance have smoothed closing speed ~= 0 and earn
+  # no boost. Raised from an original 3.0 after testing showed
+  # frame-to-frame tracking jitter alone could occasionally cross a
+  # low, unsmoothed threshold.
+  closing_speed_threshold_px_per_frame: 6.0
 
 motion:
   # Minimum relative pixel speed (px/frame) at or below which an object
@@ -60,24 +98,27 @@ motion:
 accident:
   # A frame's instantaneous accident_probability at or above this
   # value opens (or keeps open) a "possible incident" window for that
-  # pair — the first step of the Phase 7 temporal-verification FSM.
+  # PAIR — the first step of the Phase 7 temporal-verification FSM.
   possible_incident_score: 0.5
   # The instantaneous score must reach this level for a persistence
-  # streak to actually confirm as ACCIDENT (not just possible_incident_score) —
-  # keeps a long streak of only mildly-elevated scores from confirming.
+  # streak to actually confirm a PAIR as ACCIDENT (not just
+  # possible_incident_score) — keeps a long streak of only
+  # mildly-elevated scores from confirming.
   accident_score: 0.75
-  # Number of CONSECUTIVE qualifying frames (score >= possible_incident_score)
-  # required before a "possible incident" is confirmed as an accident.
-  # This is what makes "do not classify an accident from a single frame"
-  # actually true: one high frame alone (streak=1) can never reach this.
+  # Number of CONSECUTIVE qualifying frames (score >= the relevant
+  # possible_incident_score) required before a "possible incident" is
+  # confirmed as an accident. This is what makes "do not classify an
+  # accident from a single frame" actually true: one high frame alone
+  # (streak=1) can never reach this. Shared by both the pairwise and
+  # single-object pathways.
   temporal_verification_frames: 15
-  # How the three evidence types are weighted into one instantaneous
-  # per-frame accident_probability, BEFORE temporal verification.
-  # Reused/derived from Phase 6's CollisionScore fields:
+  # How the three PAIRWISE evidence types are weighted into one
+  # instantaneous per-frame accident_probability, BEFORE temporal
+  # verification. Reused/derived from Phase 6's CollisionScore fields:
   #   collision  <- spatial_interaction_score, floored to at least
-  #                 active_contact_floor while contact is currently
-  #                 active (being in contact at all is itself moderate
-  #                 evidence, regardless of exact overlap depth)
+  #                 active_contact_floor ONLY while contact has been
+  #                 overlapping for min_overlap_streak_frames straight
+  #                 frames (not a single-frame glimpse)
   #   motion     <- max(motion_change_score, post_interaction_stopping_score)
   #                 (max, not average: a sudden-deceleration SPIKE at
   #                 the moment of impact and SUSTAINED stillness
@@ -92,28 +133,46 @@ accident:
     collision: 0.40
     motion: 0.35
     trajectory: 0.25
-  # Floor applied to collision_evidence while a pair is in ACTIVE
-  # spatial contact this exact frame (CollisionScore.is_active_spatial_contact),
-  # regardless of how deep the overlap/closeness actually is. Being in
-  # contact at all is itself meaningful, persistent evidence.
+  # Floor applied to collision_evidence once a pair has shown genuine
+  # bbox overlap for min_overlap_streak_frames consecutive frames.
   active_contact_floor: 0.5
+  # SINGLE-OBJECT anomaly thresholds — deliberately much stricter than
+  # the pairwise ones above. Real-footage testing showed the original
+  # single-object pathway (reusing the pairwise 0.5/0.75 thresholds)
+  # flagged ordinary braking and turning across nearly every vehicle in
+  # frame, since is_sudden_deceleration/is_sudden_direction_change
+  # individually fire constantly in normal traffic — they were tuned as
+  # PAIRWISE co-signals (one of several), not as a strict solo bar.
+  # A solo anomaly needs much stronger, more sustained evidence before
+  # it's trusted at all.
+  single_object_possible_incident_score: 0.70
+  single_object_accident_score: 0.90
   # Weighting for SINGLE-OBJECT anomaly evidence (an object showing
-  # extreme, simultaneous sudden-deceleration + sudden-direction-change
-  # with no interacting partner at all — e.g. a motorcycle losing
-  # control and going down with no other vehicle touching it). Added
-  # after real-footage testing showed this exact scenario going
-  # completely undetected: the pairwise-only formula above has no
-  # signal to work with when there is no second object. Deliberately
-  # has no "collision" component (there is no second object to be in
-  # contact with), so these two must sum to 1.0 on their own. This is
-  # a genuine scope EXTENSION beyond the original Phase 6/7 spec (which
-  # only describes pairwise collision evidence) — not a guaranteed fix:
-  # if tracking itself breaks during a violent fall (occlusion, motion
-  # blur), there is no motion history left to evaluate at all, and no
-  # scoring change can recover that.
+  # extreme motion with no interacting partner at all — e.g. a
+  # motorcycle losing control and going down with no other vehicle
+  # touching it). This is a genuine scope EXTENSION beyond the original
+  # Phase 6/7 spec (which only describes pairwise collision evidence),
+  # added after real-footage testing showed a real gap: the pairwise
+  # formula has no signal to work with when there is no second object.
+  #   motion     <- instantaneous deceleration-ratio spike (transient —
+  #                 present only in the frame(s) right around the fall)
+  #   trajectory <- instantaneous direction-change ratio (same caveat)
+  #   stillness  <- whether the object has REMAINED stationary since
+  #                 (persistent, like pairwise's post_interaction_stopping
+  #                 — the most reliable long-duration discriminator
+  #                 between "actually went down" and "braked hard, then
+  #                 moved off again a second later", which ordinary
+  #                 traffic does constantly). Given the largest weight
+  #                 for exactly that reason.
+  # Deliberately has no "collision" component (there is no second
+  # object to be in contact with), so these three must sum to 1.0 on
+  # their own. Still not a guaranteed fix: if tracking itself breaks
+  # during a violent fall (occlusion, motion blur), there is no motion
+  # history left to evaluate, and no scoring change can recover that.
   single_object_evidence_weights:
-    motion: 0.60
-    trajectory: 0.40
+    motion: 0.35
+    trajectory: 0.25
+    stillness: 0.40
 
 evidence:
   # Seconds of rolling buffer kept before/after a confirmed accident

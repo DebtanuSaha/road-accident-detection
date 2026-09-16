@@ -75,12 +75,18 @@ def draw_assessments(frame, tracked_objects, assessments):
         if a.is_single_object:
             # Loss-of-control pathway: one object, no partner -> draw its
             # box only, no connecting line (there is nothing to connect to).
+            # Only draw once CONFIRMED — real-footage testing showed
+            # displaying every unconfirmed "solo" candidate (which fires
+            # on ordinary braking/turning constantly) buried the display
+            # in noise and looked like a wall of false alarms even though
+            # none of them had actually been confirmed.
+            if not a.confirmed:
+                continue
             x1, y1, x2, y2 = obj_a.bbox.as_int_tuple()
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
-            label = "LOSS OF CONTROL" if a.confirmed else f"solo p={a.accident_probability:.2f}"
             cv2.putText(
-                annotated, label, (x1, max(y1 - 8, 12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55 if a.confirmed else 0.5, color, 2, cv2.LINE_AA,
+                annotated, "LOSS OF CONTROL", (x1, max(y1 - 8, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
             )
             continue
 

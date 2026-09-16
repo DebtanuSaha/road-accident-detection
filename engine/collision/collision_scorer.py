@@ -24,6 +24,18 @@ frames afterward even once the boxes have separated again — a real
 collision's aftermath (vehicles stopping, swerving) naturally lags the
 contact moment by a frame or two.
 
+Also tracks two additional per-pair signals consumed by Phase 7's
+AccidentScorer to distinguish genuine contact from camera-perspective
+artifacts (added after real-footage testing kept showing ordinary
+adjacent-lane traffic flagged as colliding):
+  - `overlap_streak_frames` — how many CONSECUTIVE frames real bbox
+    overlap has been observed. A one-frame overlap from near/far-lane
+    perspective compression looks very different from a streak of 3+.
+  - `closing_speed_px_per_frame` — EXPONENTIALLY SMOOTHED rate the
+    pair's center distance is shrinking, not a raw 2-frame derivative
+    (which is noisy enough at typical CCTV tracking precision to
+    spuriously cross a low threshold from jitter alone).
+
 This module produces a SCORE, not a decision. "Do not classify an
 accident from a single frame" is honored two ways here: (a) the
 composite score only gets high when several independent signals agree
@@ -49,6 +61,12 @@ logger = get_logger(__name__)
 
 PairKey = Tuple[int, int]
 
+# Smoothing factor for the closing-speed EMA (0 < alpha <= 1). Lower =
+# smoother/less reactive to a single noisy frame, higher = tracks raw
+# per-frame changes more closely. Not exposed via thresholds.yaml —
+# an internal noise-rejection detail rather than a scoring policy knob.
+_CLOSING_SPEED_EMA_ALPHA = 0.4
+
 
 def _pair_key(id_a: int, id_b: int) -> PairKey:
     return (id_a, id_b) if id_a <= id_b else (id_b, id_a)
@@ -62,6 +80,8 @@ class _PairWindow:
     peak_spatial_score: float
     last_distance_px: Optional[float] = None
     last_distance_frame: Optional[int] = None
+    consecutive_overlap_frames: int = 0
+    smoothed_closing_speed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -82,8 +102,10 @@ class CollisionScore:
     composite_score: float
 
     is_active_spatial_contact: bool  # boxes overlapping/close THIS exact frame
-    is_overlapping: bool  # TRUE bounding-box overlap this frame — stronger than mere closeness
-    closing_speed_px_per_frame: float  # rate the pair's center distance is SHRINKING; 0 if unknown/separating
+    is_overlapping: bool  # TRUE bounding-box overlap this frame (strict entry threshold)
+    is_sustained_contact: bool  # pair remains in contact via the looser SUSTAIN thresholds (collision aftermath)
+    overlap_streak_frames: int  # consecutive frames of real overlap (carried through the grace window)
+    closing_speed_px_per_frame: float  # SMOOTHED rate the pair's center distance is SHRINKING; 0 if not fresh this frame
     in_post_interaction_window: bool  # still within the grace window after a past contact
 
     def to_dict(self) -> dict:
@@ -98,6 +120,8 @@ class CollisionScore:
             "composite_score": round(self.composite_score, 4),
             "is_active_spatial_contact": self.is_active_spatial_contact,
             "is_overlapping": self.is_overlapping,
+            "is_sustained_contact": self.is_sustained_contact,
+            "overlap_streak_frames": self.overlap_streak_frames,
             "closing_speed_px_per_frame": round(self.closing_speed_px_per_frame, 3),
             "in_post_interaction_window": self.in_post_interaction_window,
         }
@@ -144,29 +168,45 @@ class CollisionScorer:
         }
 
         # 1) Register/refresh this frame's spatial contacts into the per-pair
-        #    window, computing closing speed (rate the gap is shrinking) from
-        #    the previous time we had fresh geometry for this pair.
-        closing_speeds: Dict[PairKey, float] = {}
+        #    window: peak spatial score, EMA-smoothed closing speed, and the
+        #    consecutive-overlap streak (reset to 0 the instant a frame with
+        #    fresh geometry shows no real overlap; carried forward unchanged
+        #    for frames without fresh geometry — see class docstring).
         for key, interaction in interactions_by_pair.items():
             existing = self._pair_windows.get(key)
             peak = interaction.spatial_score if existing is None else max(existing.peak_spatial_score, interaction.spatial_score)
 
-            closing_speed = 0.0
+            closing_speed_raw = 0.0
             if existing is not None and existing.last_distance_px is not None and existing.last_distance_frame is not None:
                 frame_delta = frame_index - existing.last_distance_frame
                 if frame_delta > 0:
                     # Positive = distance shrinking (approaching each other);
-                    # negative = separating. Two vehicles holding a constant
-                    # safe distance (e.g. parallel travel in adjacent lanes)
-                    # have closing_speed ~= 0 regardless of how "close" they are.
-                    closing_speed = (existing.last_distance_px - interaction.center_distance_px) / frame_delta
-            closing_speeds[key] = closing_speed
+                    # negative = separating.
+                    closing_speed_raw = (existing.last_distance_px - interaction.center_distance_px) / frame_delta
+
+            prev_smoothed = existing.smoothed_closing_speed if existing is not None else 0.0
+            smoothed_closing_speed = (
+                _CLOSING_SPEED_EMA_ALPHA * closing_speed_raw + (1 - _CLOSING_SPEED_EMA_ALPHA) * prev_smoothed
+            )
+
+            if interaction.is_overlapping:
+                prev_streak = existing.consecutive_overlap_frames if existing is not None else 0
+                contiguous = (
+                    existing is not None
+                    and existing.last_interaction_frame == frame_index - 1
+                    and prev_streak > 0
+                )
+                overlap_streak = prev_streak + 1 if contiguous else 1
+            else:
+                overlap_streak = 0
 
             self._pair_windows[key] = _PairWindow(
                 last_interaction_frame=frame_index,
                 peak_spatial_score=peak,
                 last_distance_px=interaction.center_distance_px,
                 last_distance_frame=frame_index,
+                consecutive_overlap_frames=overlap_streak,
+                smoothed_closing_speed=smoothed_closing_speed,
             )
 
         # 2) Every pair still within its post-interaction window gets scored
@@ -192,13 +232,16 @@ class CollisionScorer:
             interaction = interactions_by_pair.get(key)
             if interaction is not None:
                 effective_spatial_score = interaction.spatial_score
+                closing_speed = window.smoothed_closing_speed
             else:
                 # Still within the grace window but not in contact this
                 # exact frame — credit half the peak so the composite
                 # doesn't collapse to near-zero the instant boxes
                 # separate slightly. This is what lets indicators #6/#7
-                # (post-interaction behaviour) actually register.
+                # (post-interaction behaviour) actually register. Closing
+                # speed isn't meaningful without fresh geometry this frame.
                 effective_spatial_score = window.peak_spatial_score * 0.5
+                closing_speed = 0.0
 
             state_a = motion_states.get(id_a)
             state_b = motion_states.get(id_b)
@@ -228,7 +271,9 @@ class CollisionScorer:
                 composite_score=composite,
                 is_active_spatial_contact=interaction is not None,
                 is_overlapping=(interaction.is_overlapping if interaction is not None else False),
-                closing_speed_px_per_frame=(closing_speeds.get(key, 0.0) if interaction is not None else 0.0),
+                is_sustained_contact=(interaction.is_sustained_contact if interaction is not None else False),
+                overlap_streak_frames=window.consecutive_overlap_frames,
+                closing_speed_px_per_frame=closing_speed,
                 in_post_interaction_window=True,
             )
             scores.append(score)

@@ -107,7 +107,7 @@ def test_compute_center_distance():
 def test_detector_finds_overlapping_pair(cfg):
     detector = CollisionDetector(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     interactions = detector.find_interactions([a, b])
     assert len(interactions) == 1
     assert interactions[0].is_overlapping is True
@@ -142,7 +142,7 @@ def test_detector_ignores_inactive_objects(cfg):
 def test_detector_handles_three_objects_pairwise(cfg):
     detector = CollisionDetector(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))  # overlaps a
+    b = make_tracked_object(2, (30, 30, 130, 130))  # overlaps a
     c = make_tracked_object(3, (1000, 1000, 1020, 1020))  # isolated
     interactions = detector.find_interactions([a, b, c])
     pairs = {(i.track_id_a, i.track_id_b) for i in interactions}
@@ -152,9 +152,12 @@ def test_detector_handles_three_objects_pairwise(cfg):
 def test_spatial_interaction_to_dict_schema(cfg):
     detector = CollisionDetector(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     d = detector.find_interactions([a, b])[0].to_dict()
-    assert set(d.keys()) == {"pair", "iou", "center_distance_px", "is_overlapping", "is_close", "spatial_score"}
+    assert set(d.keys()) == {
+        "pair", "iou", "center_distance_px", "is_overlapping", "is_sustained_contact",
+        "is_close", "spatial_score",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +167,7 @@ def test_spatial_interaction_to_dict_schema(cfg):
 def test_scorer_pure_overlap_no_motion_signal_gives_moderate_score(cfg):
     scorer = CollisionScorer(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scores = scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
 
     assert len(scores) == 1
@@ -215,7 +218,7 @@ def test_scorer_ignores_non_interacting_pairs(cfg):
 def test_scorer_keeps_scoring_pair_within_post_interaction_window(cfg):
     scorer = CollisionScorer(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
 
     # Objects separate (no longer overlapping/close) on the next frame.
@@ -236,7 +239,7 @@ def test_scorer_evicts_pair_after_window_expires(cfg):
     scorer._post_interaction_window_frames = 2
 
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
 
     a2 = make_tracked_object(1, (0, 0, 20, 20))
@@ -251,7 +254,7 @@ def test_scorer_evicts_pair_after_window_expires(cfg):
 def test_scorer_reset_clears_pair_windows(cfg):
     scorer = CollisionScorer(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
     assert len(scorer._pair_windows) == 1
 
@@ -262,7 +265,7 @@ def test_scorer_reset_clears_pair_windows(cfg):
 def test_scorer_skips_pair_when_one_object_no_longer_tracked(cfg):
     scorer = CollisionScorer(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
 
     # Object 2 vanished entirely (not even passed in as inactive).
@@ -274,32 +277,64 @@ def test_scorer_skips_pair_when_one_object_no_longer_tracked(cfg):
 def test_collision_score_to_dict_schema(cfg):
     scorer = CollisionScorer(cfg)
     a = make_tracked_object(1, (0, 0, 100, 100))
-    b = make_tracked_object(2, (50, 50, 150, 150))
+    b = make_tracked_object(2, (30, 30, 130, 130))
     scores = scorer.update([a, b], {}, frame_index=0, timestamp_ms=0.0)
     d = scores[0].to_dict()
     expected_keys = {
         "pair", "classes", "frame_index", "spatial_interaction_score",
         "trajectory_change_score", "motion_change_score", "post_interaction_stopping_score",
         "composite_score", "is_active_spatial_contact", "is_overlapping",
-        "closing_speed_px_per_frame", "in_post_interaction_window",
+        "is_sustained_contact", "overlap_streak_frames", "closing_speed_px_per_frame",
+        "in_post_interaction_window",
     }
     assert set(d.keys()) == expected_keys
+
+
+def test_overlap_streak_increments_across_consecutive_frames(cfg):
+    scorer = CollisionScorer(cfg)
+    last = None
+    for i in range(4):
+        a = make_tracked_object(1, (0, 0, 100, 100))
+        b = make_tracked_object(2, (30, 30, 130, 130))  # sustained real overlap
+        scores = scorer.update([a, b], {}, frame_index=i, timestamp_ms=i * 100.0)
+        last = scores[0]
+    assert last.overlap_streak_frames == 4
+
+
+def test_overlap_streak_resets_when_overlap_stops(cfg):
+    scorer = CollisionScorer(cfg)
+    for i in range(3):
+        scorer.update(
+            [make_tracked_object(1, (0, 0, 100, 100)), make_tracked_object(2, (30, 30, 130, 130))],
+            {}, frame_index=i, timestamp_ms=i * 100.0,
+        )
+    # Now close but NOT overlapping -> streak must reset to 0.
+    scores = scorer.update(
+        [make_tracked_object(1, (0, 0, 20, 20)), make_tracked_object(2, (25, 0, 45, 20))],
+        {}, frame_index=3, timestamp_ms=300.0,
+    )
+    assert scores[0].is_overlapping is False
+    assert scores[0].overlap_streak_frames == 0
 
 
 def test_closing_speed_is_positive_when_pair_approaches(cfg):
     scorer = CollisionScorer(cfg)
     # Frame 0: 35px apart (within min_center_distance_px=40, so registered as
-    # "close"). Frame 1: 15px apart -> approaching at 20px/frame.
+    # "close"). Then closing 20px per frame. The reported value is
+    # EXPONENTIALLY SMOOTHED (see _CLOSING_SPEED_EMA_ALPHA) rather than a raw
+    # 2-frame derivative, so it rises toward 20 over several frames rather
+    # than jumping straight to it — assert it's clearly positive and trending
+    # up, not an exact single-frame value.
     a0 = make_tracked_object(1, (0, 0, 20, 20))     # center (10,10)
     b0 = make_tracked_object(2, (35, 0, 55, 20))    # center (45,10) -> distance 35
     scorer.update([a0, b0], {}, frame_index=0, timestamp_ms=0.0)
 
     a1 = make_tracked_object(1, (0, 0, 20, 20))
     b1 = make_tracked_object(2, (15, 0, 35, 20))    # center (25,10) -> distance 15
-    scores = scorer.update([a1, b1], {}, frame_index=1, timestamp_ms=100.0)
+    first = scorer.update([a1, b1], {}, frame_index=1, timestamp_ms=100.0)[0]
 
-    assert len(scores) == 1
-    assert scores[0].closing_speed_px_per_frame == pytest.approx(20.0)
+    assert first.closing_speed_px_per_frame > 0.0
+    assert first.closing_speed_px_per_frame < 20.0  # smoothed, hasn't reached the raw rate yet
 
 
 def test_closing_speed_is_near_zero_for_parallel_travel(cfg):
@@ -353,3 +388,54 @@ def test_end_to_end_converging_objects_produce_rising_collision_score(cfg):
 
     assert len(composite_scores) > 0, "expected at least one collision score once the cars meet"
     assert max(composite_scores) > 0.15, "composite score should rise as the cars collide and stop"
+
+
+def test_hysteresis_keeps_settled_pair_interacting(cfg):
+    """
+    Regression test for the false NEGATIVE found by real-footage
+    debugging: after two objects genuinely collide, they settle just
+    outside the strict entry thresholds (measured at IoU ~0.13 /
+    distance ~52px on real detections). Without asymmetric entry/exit
+    thresholds the pair stops being scored entirely at that point,
+    cutting off its confirmation streak partway.
+    """
+    detector = CollisionDetector(cfg)
+    # Frame 0: strong overlap -> pair enters the interacting set.
+    a = make_tracked_object(1, (0, 0, 100, 100))
+    b = make_tracked_object(2, (30, 30, 130, 130))
+    assert len(detector.find_interactions([a, b])) == 1
+
+    # Frame 1: settled apart — below the strict entry IoU (0.15) and
+    # beyond the strict entry distance (40px), but still within the
+    # looser sustain bounds. Must REMAIN an interaction.
+    a2 = make_tracked_object(1, (0, 0, 100, 100))
+    b2 = make_tracked_object(2, (55, 55, 155, 155))
+    interactions = detector.find_interactions([a2, b2])
+    assert len(interactions) == 1
+    assert interactions[0].is_sustained_contact is True
+
+
+def test_fresh_pair_is_not_marked_sustained_contact(cfg):
+    """A pair that merely drifts near each other (never genuinely entered
+    contact) must not be credited with sustained-contact status."""
+    detector = CollisionDetector(cfg)
+    a = make_tracked_object(1, (0, 0, 20, 20))
+    b = make_tracked_object(2, (25, 0, 45, 20))  # close, not overlapping
+    interactions = detector.find_interactions([a, b])
+    assert len(interactions) == 1
+    assert interactions[0].is_sustained_contact is False
+
+
+def test_pair_is_dropped_once_fully_separated(cfg):
+    """Hysteresis must not keep a pair alive forever — once it's beyond
+    even the loose sustain bounds, the interaction ends."""
+    detector = CollisionDetector(cfg)
+    detector.find_interactions([
+        make_tracked_object(1, (0, 0, 100, 100)),
+        make_tracked_object(2, (30, 30, 130, 130)),
+    ])
+    far = detector.find_interactions([
+        make_tracked_object(1, (0, 0, 100, 100)),
+        make_tracked_object(2, (900, 900, 1000, 1000)),
+    ])
+    assert far == []

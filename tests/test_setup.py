@@ -55,3 +55,23 @@ def test_thresholds_values_are_sane():
 
 def test_database_url_points_to_sqlite_by_default():
     assert settings.DATABASE_URL.startswith("sqlite:///")
+
+
+def test_post_interaction_window_covers_verification_streak():
+    """
+    Guards the invariant found the hard way during real-footage
+    debugging: if a pair stops being scored before its confirmation
+    streak can complete, real collisions can never be confirmed.
+    """
+    data = load_thresholds()
+    assert (
+        data["collision"]["post_interaction_window_frames"]
+        >= data["accident"]["temporal_verification_frames"]
+    )
+
+
+def test_sustain_thresholds_are_looser_than_entry_thresholds():
+    """Hysteresis only works if exit bounds are genuinely looser than entry bounds."""
+    collision = load_thresholds()["collision"]
+    assert collision["sustain_bbox_overlap_iou"] <= collision["bbox_overlap_iou"]
+    assert collision["sustain_min_center_distance_px"] >= collision["min_center_distance_px"]

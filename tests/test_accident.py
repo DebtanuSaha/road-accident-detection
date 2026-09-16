@@ -37,8 +37,13 @@ from engine.accident import (  # noqa: E402
 
 def make_collision_score(
     spatial=0.0, motion=0.0, trajectory=0.0, stopping=0.0, frame_index=0, pair=(1, 2),
-    is_overlapping=True, closing_speed=0.0,
+    is_overlapping=True, closing_speed=0.0, overlap_streak=99, is_sustained_contact=False,
 ):
+    """
+    `overlap_streak` defaults high so the active-contact floor applies by
+    default in tests that are exercising something other than the streak
+    gate itself; pass a low value to test that gate specifically.
+    """
     return CollisionScore(
         track_id_a=pair[0],
         track_id_b=pair[1],
@@ -53,6 +58,8 @@ def make_collision_score(
         composite_score=0.0,  # irrelevant to Phase 7, which recomputes its own weighting
         is_active_spatial_contact=True,
         is_overlapping=is_overlapping,
+        is_sustained_contact=is_sustained_contact,
+        overlap_streak_frames=overlap_streak,
         closing_speed_px_per_frame=closing_speed,
         in_post_interaction_window=True,
     )
@@ -106,8 +113,8 @@ def test_compute_evidence_no_floor_when_not_in_active_contact(cfg):
         frame_index=0, timestamp_ms=0.0,
         spatial_interaction_score=0.05, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
-        composite_score=0.0, is_active_spatial_contact=False, is_overlapping=False,
-        closing_speed_px_per_frame=0.0, in_post_interaction_window=True,
+        composite_score=0.0, is_active_spatial_contact=False, is_overlapping=False, is_sustained_contact=False,
+        overlap_streak_frames=0, closing_speed_px_per_frame=0.0, in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
     assert evidence.collision_evidence == pytest.approx(0.05)  # no floor applied
@@ -128,8 +135,8 @@ def test_compute_evidence_no_floor_when_close_but_not_overlapping(cfg):
         frame_index=0, timestamp_ms=0.0,
         spatial_interaction_score=0.15, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
-        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False,
-        closing_speed_px_per_frame=0.0,  # traveling in parallel — gap isn't shrinking
+        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False, is_sustained_contact=False,
+        overlap_streak_frames=0, closing_speed_px_per_frame=0.0,  # traveling in parallel — gap isn't shrinking
         in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
@@ -145,8 +152,8 @@ def test_compute_evidence_closing_speed_gives_partial_boost_without_overlap(cfg,
         frame_index=0, timestamp_ms=0.0,
         spatial_interaction_score=0.1, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
-        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False,
-        closing_speed_px_per_frame=100.0,  # far above threshold -> full ratio (capped at 1.0)
+        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False, is_sustained_contact=False,
+        overlap_streak_frames=0, closing_speed_px_per_frame=100.0,  # far above threshold -> full ratio (capped at 1.0)
         in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
@@ -161,8 +168,8 @@ def test_compute_evidence_overlap_still_floors_regardless_of_closing_speed(cfg, 
         frame_index=0, timestamp_ms=0.0,
         spatial_interaction_score=0.05, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
-        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=True,
-        closing_speed_px_per_frame=0.0,
+        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=True, is_sustained_contact=False,
+        overlap_streak_frames=99, closing_speed_px_per_frame=0.0,
         in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
@@ -203,7 +210,9 @@ def test_classify_accident_tier(cfg, accident_cfg):
 
 def test_evidence_to_dict_schema():
     evidence = AccidentEvidence(0.1, 0.2, 0.3)
-    assert set(evidence.to_dict().keys()) == {"collision_evidence", "motion_evidence", "trajectory_evidence"}
+    assert set(evidence.to_dict().keys()) == {
+        "collision_evidence", "motion_evidence", "trajectory_evidence", "stillness_evidence",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -401,21 +410,22 @@ def test_sustained_parallel_traffic_never_confirms(cfg, accident_cfg):
 def test_single_object_loss_of_control_can_confirm_without_a_partner(cfg, accident_cfg):
     """
     Regression test for the false negative seen in real footage: a
-    motorcycle suddenly losing control (extreme, sustained
-    deceleration + direction change) with NO second object involved
-    must still be detectable, via the single-object pathway.
+    motorcycle suddenly losing control (extreme deceleration +
+    direction change) AND then remaining down must be detectable via
+    the single-object pathway, with no second object involved.
     """
     detector = AccidentDetector(cfg)
     from engine.motion import MotionState
 
     n = accident_cfg["temporal_verification_frames"]
-    erratic_state = MotionState(
-        track_id=99, frame_index=0, center=(0.0, 0.0), displacement_px=5.0,
-        direction_deg=90.0, speed_px_per_frame=2.0, speed_px_per_sec=None,
+    # Went down and STAYED down — is_stationary carries the persistent evidence.
+    downed_state = MotionState(
+        track_id=99, frame_index=0, center=(0.0, 0.0), displacement_px=0.5,
+        direction_deg=90.0, speed_px_per_frame=0.5, speed_px_per_sec=None,
         previous_speed_px_per_frame=20.0, speed_change_px_per_frame=-18.0,
-        direction_change_deg=170.0, is_stationary=False,
+        direction_change_deg=170.0, is_stationary=True,
         is_sudden_deceleration=True, is_sudden_direction_change=True,
-        is_sudden_stop=False, sample_count=5,
+        is_sudden_stop=True, sample_count=5,
     )
     tracked = [make_tracked_object(99, "motorcycle")]
 
@@ -423,7 +433,7 @@ def test_single_object_loss_of_control_can_confirm_without_a_partner(cfg, accide
     for i in range(n):
         results = detector.update(
             [], frame_index=i, timestamp_ms=i * 100.0,
-            motion_states={99: erratic_state}, tracked_objects=tracked,
+            motion_states={99: downed_state}, tracked_objects=tracked,
         )
         single_object_results = [r for r in results if r.is_single_object]
         assert len(single_object_results) == 1
@@ -432,6 +442,38 @@ def test_single_object_loss_of_control_can_confirm_without_a_partner(cfg, accide
             break
 
     assert confirmed_at is not None, "a sustained single-object anomaly should eventually confirm"
+
+
+def test_single_object_hard_braking_that_keeps_moving_never_confirms(cfg, accident_cfg):
+    """
+    Regression test for the false positives seen in real footage (a
+    screenful of "solo p=0.xx" labels on ordinary traffic): a vehicle
+    braking hard and steering sharply but CONTINUING TO MOVE must never
+    confirm. The stillness component is what separates "braked hard"
+    from "actually went down and stayed there".
+    """
+    detector = AccidentDetector(cfg)
+    from engine.motion import MotionState
+
+    braking_state = MotionState(
+        track_id=42, frame_index=0, center=(0.0, 0.0), displacement_px=8.0,
+        direction_deg=90.0, speed_px_per_frame=8.0, speed_px_per_sec=None,
+        previous_speed_px_per_frame=20.0, speed_change_px_per_frame=-18.0,
+        direction_change_deg=170.0, is_stationary=False,  # still moving
+        is_sudden_deceleration=True, is_sudden_direction_change=True,
+        is_sudden_stop=False, sample_count=5,
+    )
+    tracked = [make_tracked_object(42, "car")]
+
+    any_confirmed = False
+    for i in range(accident_cfg["temporal_verification_frames"] * 3):
+        results = detector.update(
+            [], frame_index=i, timestamp_ms=i * 100.0,
+            motion_states={42: braking_state}, tracked_objects=tracked,
+        )
+        any_confirmed = any_confirmed or any(r.confirmed for r in results)
+
+    assert any_confirmed is False
 
 
 def test_single_object_pathway_ignored_when_no_motion_states_passed(cfg):
