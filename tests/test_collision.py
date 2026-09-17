@@ -439,3 +439,99 @@ def test_pair_is_dropped_once_fully_separated(cfg):
         make_tracked_object(2, (900, 900, 1000, 1000)),
     ])
     assert far == []
+
+
+# ---------------------------------------------------------------------------
+# Mutual corroboration (real-footage regression: a vehicle turning near an
+# undisturbed neighbor was being flagged as a collision)
+# ---------------------------------------------------------------------------
+
+def test_mutual_corroboration_blend_one_sided_is_discounted():
+    from engine.collision.collision_scorer import _mutual_corroboration_blend
+    assert _mutual_corroboration_blend(1.0, 0.0) == pytest.approx(0.5)
+
+
+def test_mutual_corroboration_blend_fully_mutual_is_unchanged():
+    from engine.collision.collision_scorer import _mutual_corroboration_blend
+    assert _mutual_corroboration_blend(1.0, 1.0) == pytest.approx(1.0)
+
+
+def test_mutual_corroboration_blend_partial():
+    from engine.collision.collision_scorer import _mutual_corroboration_blend
+    assert _mutual_corroboration_blend(1.0, 0.5) == pytest.approx(0.75)
+
+
+def test_mutual_corroboration_blend_both_zero():
+    from engine.collision.collision_scorer import _mutual_corroboration_blend
+    assert _mutual_corroboration_blend(0.0, 0.0) == 0.0
+
+
+def test_trajectory_change_score_discounts_one_sided_turn(cfg):
+    """
+    Regression test for the exact real-footage false positive: one
+    object turning sharply (large direction_change_deg) right next to a
+    completely undisturbed neighbor must score well below what a
+    genuinely mutual disturbance would.
+    """
+    scorer = CollisionScorer(cfg)
+    turning = make_motion_state(1, direction_change_deg=180.0)  # maximal turn ratio
+    undisturbed = make_motion_state(2, direction_change_deg=0.0)
+    one_sided = scorer._trajectory_change_score(turning, undisturbed)
+
+    both_turning = make_motion_state(2, direction_change_deg=180.0)
+    mutual = scorer._trajectory_change_score(turning, both_turning)
+
+    assert one_sided < mutual
+    assert one_sided == pytest.approx(0.5)  # fully one-sided -> discounted to 50%
+    assert mutual == pytest.approx(1.0)     # fully mutual -> full strength
+
+
+def test_motion_change_score_discounts_one_sided_deceleration(cfg):
+    scorer = CollisionScorer(cfg)
+    decelerating = make_motion_state(1, speed_change_px_per_frame=-20.0, previous_speed_px_per_frame=20.0)
+    steady = make_motion_state(2, speed_change_px_per_frame=0.0, previous_speed_px_per_frame=20.0)
+    one_sided = scorer._motion_change_score(decelerating, steady)
+    assert one_sided == pytest.approx(0.5)
+
+
+def make_motion_state(track_id, direction_change_deg=None, speed_change_px_per_frame=None,
+                       previous_speed_px_per_frame=None, is_stationary=False):
+    from engine.motion import MotionState
+    return MotionState(
+        track_id=track_id, frame_index=0, center=(0.0, 0.0), displacement_px=0.0,
+        direction_deg=0.0, speed_px_per_frame=0.0, speed_px_per_sec=None,
+        previous_speed_px_per_frame=previous_speed_px_per_frame,
+        speed_change_px_per_frame=speed_change_px_per_frame,
+        direction_change_deg=direction_change_deg, is_stationary=is_stationary,
+        is_sudden_deceleration=False, is_sudden_direction_change=False,
+        is_sudden_stop=False, sample_count=3,
+    )
+
+
+def test_end_to_end_one_sided_turn_near_undisturbed_neighbor_scores_lower_than_mutual(cfg):
+    """
+    Full CollisionScorer integration version of the same regression:
+    feeds real MotionStates through update() for a pair where only one
+    object is disturbed, and confirms the resulting composite score is
+    meaningfully lower than the same scenario with both objects disturbed.
+    """
+    scorer = CollisionScorer(cfg)
+    a = make_tracked_object(1, (0, 0, 100, 100))
+    b = make_tracked_object(2, (30, 30, 130, 130))
+
+    one_sided_states = {
+        1: make_motion_state(1, direction_change_deg=180.0, speed_change_px_per_frame=-15.0, previous_speed_px_per_frame=15.0),
+        2: make_motion_state(2, direction_change_deg=0.0, speed_change_px_per_frame=0.0, previous_speed_px_per_frame=15.0),
+    }
+    mutual_states = {
+        1: one_sided_states[1],
+        2: make_motion_state(2, direction_change_deg=180.0, speed_change_px_per_frame=-15.0, previous_speed_px_per_frame=15.0),
+    }
+
+    one_sided_score = scorer.update([a, b], one_sided_states, frame_index=0, timestamp_ms=0.0)[0]
+    scorer.reset()
+    mutual_score = scorer.update([a, b], mutual_states, frame_index=0, timestamp_ms=0.0)[0]
+
+    assert one_sided_score.trajectory_change_score < mutual_score.trajectory_change_score
+    assert one_sided_score.motion_change_score < mutual_score.motion_change_score
+    assert one_sided_score.composite_score < mutual_score.composite_score

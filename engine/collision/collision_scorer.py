@@ -36,6 +36,15 @@ adjacent-lane traffic flagged as colliding):
     (which is noisy enough at typical CCTV tracking precision to
     spuriously cross a low threshold from jitter alone).
 
+MUTUAL CORROBORATION (added after real-footage testing showed a car
+mid-turn near an undisturbed, normally-moving neighboring vehicle
+flagged as ACCIDENT CONFIRMED): `trajectory_change` and `motion_change`
+now require disturbance from BOTH objects in the pair, not just one —
+see `_mutual_corroboration_blend()` for the exact formula and
+reasoning. One vehicle's ordinary turn or brake near a completely
+undisturbed neighbor no longer single-handedly maxes out a pair's
+collision evidence.
+
 This module produces a SCORE, not a decision. "Do not classify an
 accident from a single frame" is honored two ways here: (a) the
 composite score only gets high when several independent signals agree
@@ -70,6 +79,43 @@ _CLOSING_SPEED_EMA_ALPHA = 0.4
 
 def _pair_key(id_a: int, id_b: int) -> PairKey:
     return (id_a, id_b) if id_a <= id_b else (id_b, id_a)
+
+
+def _mutual_corroboration_blend(value_a: float, value_b: float) -> float:
+    """
+    Blend two per-object evidence values (each already in [0,1]) into one
+    pairwise score, discounting evidence that comes from only ONE side of
+    the pair.
+
+    ARCHITECTURAL FIX (found via real-footage debugging): the previous
+    design took max(value_a, value_b) — meaning ONE vehicle's ordinary,
+    unilateral maneuver (a normal turn, a normal lane change, normal
+    braking) could single-handedly max out a pair's "collision evidence",
+    even while its neighbor showed ZERO disturbance. A real collision
+    physically disturbs both participants to some degree (an impact
+    transfers momentum, or the struck vehicle visibly reacts) — a vehicle
+    turning near an undisturbed, normally-moving neighbor is an ordinary
+    traffic event, not two bodies interacting.
+
+    This blend keeps max(a,b) as the ceiling (so a genuinely severe
+    one-sided reading still contributes something — real crashes are
+    often asymmetric, e.g. one car brakes hard while the other barely
+    reacts) but scales it down toward 50% when the OTHER side shows
+    little to no corroborating disturbance, and keeps it at 100% when
+    both sides show comparable disturbance:
+
+        blended = max(a,b) * (0.5 + 0.5 * min(a,b)/max(a,b))
+
+    e.g. a=1.0, b=0.0 (fully one-sided)  -> 0.50
+         a=1.0, b=0.5 (partly mutual)    -> 0.75
+         a=1.0, b=1.0 (fully mutual)     -> 1.00
+    """
+    hi = max(value_a, value_b)
+    if hi <= 0.0:
+        return 0.0
+    lo = min(value_a, value_b)
+    mutual_ratio = lo / hi
+    return hi * (0.5 + 0.5 * mutual_ratio)
 
 
 @dataclass
@@ -293,28 +339,37 @@ class CollisionScorer:
     # -- per-signal component scores, each in [0, 1] -----------------------------------
 
     def _trajectory_change_score(self, a: Optional[MotionState], b: Optional[MotionState]) -> float:
-        """How much either object's heading changed, relative to the sudden-turn threshold."""
-        best = 0.0
-        for state in (a, b):
-            if state is None or state.direction_change_deg is None:
-                continue
-            if self._sudden_direction_change_deg <= 0:
-                continue
-            ratio = state.direction_change_deg / self._sudden_direction_change_deg
-            best = max(best, min(1.0, ratio))
-        return best
+        """
+        Combined heading-change evidence for the pair, requiring MUTUAL
+        (not just one-sided) disturbance — see `_mutual_corroboration_blend`
+        docstring for why this matters.
+        """
+        ratio_a = self._single_direction_ratio(a)
+        ratio_b = self._single_direction_ratio(b)
+        return _mutual_corroboration_blend(ratio_a, ratio_b)
+
+    def _single_direction_ratio(self, state: Optional[MotionState]) -> float:
+        if state is None or state.direction_change_deg is None:
+            return 0.0
+        if self._sudden_direction_change_deg <= 0:
+            return 0.0
+        return min(1.0, state.direction_change_deg / self._sudden_direction_change_deg)
 
     def _motion_change_score(self, a: Optional[MotionState], b: Optional[MotionState]) -> float:
-        """How sharply either object's speed changed, relative to its own prior speed."""
-        best = 0.0
-        for state in (a, b):
-            if state is None or state.speed_change_px_per_frame is None:
-                continue
-            if not state.previous_speed_px_per_frame:
-                continue
-            ratio = abs(state.speed_change_px_per_frame) / state.previous_speed_px_per_frame
-            best = max(best, min(1.0, ratio))
-        return best
+        """
+        Combined deceleration/acceleration evidence for the pair, requiring
+        MUTUAL (not just one-sided) disturbance.
+        """
+        ratio_a = self._single_motion_ratio(a)
+        ratio_b = self._single_motion_ratio(b)
+        return _mutual_corroboration_blend(ratio_a, ratio_b)
+
+    def _single_motion_ratio(self, state: Optional[MotionState]) -> float:
+        if state is None or state.speed_change_px_per_frame is None:
+            return 0.0
+        if not state.previous_speed_px_per_frame:
+            return 0.0
+        return min(1.0, abs(state.speed_change_px_per_frame) / state.previous_speed_px_per_frame)
 
     def _post_interaction_stopping_score(self, a: Optional[MotionState], b: Optional[MotionState]) -> float:
         """Fraction of the pair that is now stationary (0.0, 0.5, or 1.0)."""

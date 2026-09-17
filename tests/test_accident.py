@@ -484,3 +484,54 @@ def test_single_object_pathway_ignored_when_no_motion_states_passed(cfg):
     results = detector.update([cs], frame_index=0, timestamp_ms=0.0)
     assert all(not r.is_single_object for r in results)
     assert len(results) == 1  # only the pairwise result, nothing else
+
+
+def test_one_sided_turn_near_undisturbed_neighbor_never_confirms(cfg, accident_cfg):
+    """
+    Direct regression test for the real-footage false positive: a
+    vehicle turning sharply right next to a completely undisturbed
+    neighbor (axis-aligned bbox overlap inflated by the turning
+    vehicle's rotation, sustained the whole time) must never confirm —
+    this exact combination of inputs would have reached
+    ACCIDENT CONFIRMED under the pre-fix max()-based evidence blending.
+    """
+    detector = AccidentDetector(cfg)
+    from engine.collision.collision_scorer import _mutual_corroboration_blend as blend
+
+    traj = blend(1.0, 0.0)    # only one object turning
+    motion = blend(0.6, 0.0)  # only one object decelerating
+
+    any_confirmed = False
+    last = None
+    for i in range(60):
+        cs = make_collision_score(
+            spatial=0.85, motion=motion, trajectory=traj, stopping=0.0,
+            frame_index=i, overlap_streak=99,
+        )
+        results = detector.update([cs], frame_index=i, timestamp_ms=i * 100.0)
+        any_confirmed = any_confirmed or results[0].confirmed
+        last = results[0]
+
+    assert any_confirmed is False
+    assert last.accident_probability < accident_cfg["accident_score"]
+
+
+def test_mutual_disturbance_still_confirms(cfg):
+    """The mutual-corroboration fix must not break genuine collisions
+    where BOTH participants are disturbed."""
+    detector = AccidentDetector(cfg)
+    from engine.collision.collision_scorer import _mutual_corroboration_blend as blend
+
+    traj = blend(0.9, 0.9)
+    motion = blend(0.9, 0.85)
+
+    any_confirmed = False
+    for i in range(60):
+        cs = make_collision_score(
+            spatial=0.9, motion=motion, trajectory=traj, stopping=0.0,
+            frame_index=i, overlap_streak=99,
+        )
+        results = detector.update([cs], frame_index=i, timestamp_ms=i * 100.0)
+        any_confirmed = any_confirmed or results[0].confirmed
+
+    assert any_confirmed is True
