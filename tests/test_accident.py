@@ -38,12 +38,21 @@ from engine.accident import (  # noqa: E402
 def make_collision_score(
     spatial=0.0, motion=0.0, trajectory=0.0, stopping=0.0, frame_index=0, pair=(1, 2),
     is_overlapping=True, closing_speed=0.0, overlap_streak=99, is_sustained_contact=False,
+    peak_closing_speed=None,
 ):
     """
-    `overlap_streak` defaults high so the active-contact floor applies by
-    default in tests that are exercising something other than the streak
-    gate itself; pass a low value to test that gate specifically.
+    `overlap_streak` defaults high and `peak_closing_speed` defaults to
+    exactly the configured closing-speed threshold (a "just barely converged" case)
+    so the active-contact floor applies by default in tests that are
+    exercising something other than the convergence-history gate itself;
+    pass `peak_closing_speed=0.0` to test a pair that has NEVER genuinely
+    converged (e.g. pure camera-perspective overlap between two
+    independently-driving vehicles), or a large value to test a strongly-
+    converged (severe) collision.
     """
+    if peak_closing_speed is None:
+        peak_closing_speed = load_thresholds()["collision"]["closing_speed_threshold_px_per_frame"]
+
     return CollisionScore(
         track_id_a=pair[0],
         track_id_b=pair[1],
@@ -61,6 +70,7 @@ def make_collision_score(
         is_sustained_contact=is_sustained_contact,
         overlap_streak_frames=overlap_streak,
         closing_speed_px_per_frame=closing_speed,
+        peak_closing_speed_px_per_frame=peak_closing_speed,
         in_post_interaction_window=True,
     )
 
@@ -100,10 +110,38 @@ def test_compute_evidence_derives_from_collision_score(cfg):
 
 def test_compute_evidence_applies_active_contact_floor(cfg, accident_cfg):
     scorer = AccidentScorer(cfg)
-    # Low spatial score, but actively in contact -> floored up.
+    # Low spatial score, but actively in contact and genuinely converged
+    # (default peak_closing_speed) -> floored up to at least the base floor.
     cs = make_collision_score(spatial=0.05, motion=0.0, trajectory=0.0, stopping=0.0)
     evidence = scorer.compute_evidence(cs)
-    assert evidence.collision_evidence == pytest.approx(accident_cfg["active_contact_floor"])
+    assert evidence.collision_evidence >= accident_cfg["active_contact_floor"]
+
+
+def test_compute_evidence_floor_scales_with_convergence_strength(cfg, accident_cfg):
+    """
+    A marginal convergence (barely past the gate) earns roughly the base
+    floor; a severe, strongly-converged collision earns meaningfully more
+    — genuine convergence strength should not be capped at the same flat
+    value as a borderline case. Found necessary by real-footage testing:
+    a flat floor left a genuine collision's peak score just under
+    accident_score, never confirming.
+    """
+    scorer = AccidentScorer(cfg)
+    marginal = make_collision_score(
+        spatial=0.05,
+        motion=0.0,
+        trajectory=0.0,
+        stopping=0.0,
+        peak_closing_speed=load_thresholds()["collision"]["closing_speed_threshold_px_per_frame"],
+    )
+    severe = make_collision_score(spatial=0.05, motion=0.0, trajectory=0.0, stopping=0.0, peak_closing_speed=999.0)
+
+    marginal_evidence = scorer.compute_evidence(marginal).collision_evidence
+    severe_evidence = scorer.compute_evidence(severe).collision_evidence
+
+    assert marginal_evidence == pytest.approx(accident_cfg["active_contact_floor"], abs=0.2)
+    assert severe_evidence > marginal_evidence
+    assert severe_evidence == pytest.approx(1.0)  # fully saturated for an overwhelming convergence reading
 
 
 def test_compute_evidence_no_floor_when_not_in_active_contact(cfg):
@@ -114,7 +152,8 @@ def test_compute_evidence_no_floor_when_not_in_active_contact(cfg):
         spatial_interaction_score=0.05, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
         composite_score=0.0, is_active_spatial_contact=False, is_overlapping=False, is_sustained_contact=False,
-        overlap_streak_frames=0, closing_speed_px_per_frame=0.0, in_post_interaction_window=True,
+        overlap_streak_frames=0, closing_speed_px_per_frame=0.0, peak_closing_speed_px_per_frame=0.0,
+        in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
     assert evidence.collision_evidence == pytest.approx(0.05)  # no floor applied
@@ -136,7 +175,7 @@ def test_compute_evidence_no_floor_when_close_but_not_overlapping(cfg):
         spatial_interaction_score=0.15, trajectory_change_score=0.0,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
         composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False, is_sustained_contact=False,
-        overlap_streak_frames=0, closing_speed_px_per_frame=0.0,  # traveling in parallel — gap isn't shrinking
+        overlap_streak_frames=0, closing_speed_px_per_frame=0.0, peak_closing_speed_px_per_frame=0.0,  # never converged
         in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
@@ -154,14 +193,40 @@ def test_compute_evidence_closing_speed_gives_partial_boost_without_overlap(cfg,
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
         composite_score=0.0, is_active_spatial_contact=True, is_overlapping=False, is_sustained_contact=False,
         overlap_streak_frames=0, closing_speed_px_per_frame=100.0,  # far above threshold -> full ratio (capped at 1.0)
-        in_post_interaction_window=True,
+        peak_closing_speed_px_per_frame=100.0, in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
     assert evidence.collision_evidence == pytest.approx(accident_cfg["active_contact_floor"])
 
 
-def test_compute_evidence_overlap_still_floors_regardless_of_closing_speed(cfg, accident_cfg):
-    """Real overlap is the strongest signal and floors evidence even with zero closing speed."""
+def test_compute_evidence_overlap_without_prior_convergence_does_not_floor(cfg, accident_cfg):
+    """
+    Regression test for the SECOND real-footage false positive: two
+    vehicles whose boxes are heavily overlapped purely by camera
+    perspective (adjacent/converging-looking lanes), where the pair has
+    NEVER shown genuine closing speed at any point, must NOT get the
+    active-contact floor — even with a long, sustained overlap streak.
+    A real collision is always preceded by some period of actual
+    approach; a perspective artifact never converges at all.
+    """
+    scorer = AccidentScorer(cfg)
+    cs = CollisionScore(
+        track_id_a=1, track_id_b=2, class_a="car", class_b="car",
+        frame_index=0, timestamp_ms=0.0,
+        spatial_interaction_score=0.3, trajectory_change_score=0.0,
+        motion_change_score=0.0, post_interaction_stopping_score=0.0,
+        composite_score=0.0, is_active_spatial_contact=True, is_overlapping=True, is_sustained_contact=False,
+        overlap_streak_frames=99, closing_speed_px_per_frame=0.0,
+        peak_closing_speed_px_per_frame=0.0,  # never converged, ever
+        in_post_interaction_window=True,
+    )
+    evidence = scorer.compute_evidence(cs)
+    assert evidence.collision_evidence == pytest.approx(0.3)  # unfloored — raw spatial score only
+
+
+def test_compute_evidence_overlap_with_prior_convergence_still_floors(cfg, accident_cfg):
+    """The same sustained overlap DOES floor once the pair has genuinely
+    converged at some point in its history — a real collision."""
     scorer = AccidentScorer(cfg)
     cs = CollisionScore(
         track_id_a=1, track_id_b=2, class_a="car", class_b="car",
@@ -170,10 +235,11 @@ def test_compute_evidence_overlap_still_floors_regardless_of_closing_speed(cfg, 
         motion_change_score=0.0, post_interaction_stopping_score=0.0,
         composite_score=0.0, is_active_spatial_contact=True, is_overlapping=True, is_sustained_contact=False,
         overlap_streak_frames=99, closing_speed_px_per_frame=0.0,
+        peak_closing_speed_px_per_frame=999.0,  # converged strongly at some point before settling
         in_post_interaction_window=True,
     )
     evidence = scorer.compute_evidence(cs)
-    assert evidence.collision_evidence == pytest.approx(accident_cfg["active_contact_floor"])
+    assert evidence.collision_evidence >= accident_cfg["active_contact_floor"]
 
 
 def test_compute_score_uses_configured_weights(cfg, accident_cfg):
@@ -530,6 +596,53 @@ def test_mutual_disturbance_still_confirms(cfg):
         cs = make_collision_score(
             spatial=0.9, motion=motion, trajectory=traj, stopping=0.0,
             frame_index=i, overlap_streak=99,
+        )
+        results = detector.update([cs], frame_index=i, timestamp_ms=i * 100.0)
+        any_confirmed = any_confirmed or results[0].confirmed
+
+    assert any_confirmed is True
+
+
+def test_pure_perspective_overlap_never_confirms_even_with_mutual_motion_noise(cfg, accident_cfg):
+    """
+    Regression test for the SECOND real-footage false positive: two
+    vehicles heavily overlapped by camera perspective the whole time
+    (never genuinely converging), each independently showing moderate,
+    MUTUAL motion/heading noise (ordinary, uncorrelated driving —
+    already passes the mutual-corroboration check from the first fix),
+    must still never confirm. Only the convergence-history gate catches
+    this: the pair never showed real closing speed, so the active-
+    contact floor is never granted no matter how sustained or mutual
+    the surrounding evidence looks.
+    """
+    detector = AccidentDetector(cfg)
+    any_confirmed = False
+    last = None
+    for i in range(60):
+        cs = make_collision_score(
+            spatial=0.3, motion=1.0, trajectory=1.0, stopping=0.0,
+            frame_index=i, overlap_streak=99, is_overlapping=True,
+            peak_closing_speed=0.0,  # never converged
+        )
+        results = detector.update([cs], frame_index=i, timestamp_ms=i * 100.0)
+        any_confirmed = any_confirmed or results[0].confirmed
+        last = results[0]
+
+    assert any_confirmed is False
+    assert last.accident_probability < accident_cfg["accident_score"]
+
+
+def test_same_scenario_with_genuine_convergence_does_confirm(cfg):
+    """Control: identical motion/trajectory evidence DOES confirm once the
+    pair has shown genuine convergence at some point — proves the gate
+    discriminates on convergence history, not on suppressing everything."""
+    detector = AccidentDetector(cfg)
+    any_confirmed = False
+    for i in range(60):
+        cs = make_collision_score(
+            spatial=0.3, motion=1.0, trajectory=1.0, stopping=0.0,
+            frame_index=i, overlap_streak=99, is_overlapping=True,
+            peak_closing_speed=999.0,  # genuinely converged before settling
         )
         results = detector.update([cs], frame_index=i, timestamp_ms=i * 100.0)
         any_confirmed = any_confirmed or results[0].confirmed

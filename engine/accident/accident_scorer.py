@@ -172,7 +172,25 @@ class AccidentScorer:
             collision_score.is_overlapping
             and collision_score.overlap_streak_frames >= self._min_overlap_streak_frames
         )
-        if collision_score.is_active_spatial_contact and (
+        # ARCHITECTURAL GATE (added after a second round of real-footage
+        # debugging): neither `had_strong_contact` nor `is_sustained_contact`
+        # requires the pair to have ever actually CONVERGED — a pair whose
+        # boxes are simply overlapped by camera perspective (two vehicles in
+        # adjacent/converging-looking lanes, both driving normally) can
+        # satisfy either one indefinitely with zero real approach, ever. A
+        # physical collision is, by definition, always preceded by some
+        # period of genuine closing speed — you cannot hit something you
+        # never approached. Require that the pair has shown at least one
+        # frame of meaningful closing speed SOMEWHERE in its history before
+        # trusting overlap as evidence of real contact at all.
+        # TRADE-OFF, stated plainly: this can miss a collision that occurred
+        # just off-screen, with both vehicles already touching the instant
+        # they're first tracked (no observable approach phase). Accepted
+        # deliberately given repeated real-footage evidence that the
+        # perspective-overlap false positive is the far more common failure.
+        has_converged = collision_score.peak_closing_speed_px_per_frame >= self._closing_speed_threshold
+
+        if collision_score.is_active_spatial_contact and has_converged and (
             had_strong_contact
             # Keep the floor through a real collision's AFTERMATH: once a pair
             # has genuinely entered contact, two vehicles resting against each
@@ -183,10 +201,21 @@ class AccidentScorer:
             # for exactly this reason.
             or collision_score.is_sustained_contact
         ):
-            # Real, SUSTAINED bounding-box contact — the strongest, most
-            # direct signal. A single overlapping frame alone does NOT
-            # qualify (see module docstring for why that mattered).
-            collision_evidence = max(collision_evidence, self._active_contact_floor)
+            # SCALE collision_evidence between the floor and 1.0 based on HOW
+            # STRONGLY the pair converged, rather than capping every qualifying
+            # pair at the same flat floor value. Found necessary by real-
+            # footage testing: with the convergence gate above now correctly
+            # rejecting perspective-only overlap, a genuine collision's own
+            # instantaneous score peaked at only 0.705 — just under
+            # accident_score (0.75) — because a flat floor gave a marginal,
+            # barely-qualifying convergence the exact same credit as a severe
+            # one. Real, hard convergence should score meaningfully higher
+            # than a convergence that just barely cleared the gate.
+            convergence_ratio = min(
+                1.0, collision_score.peak_closing_speed_px_per_frame / (self._closing_speed_threshold * 3.0)
+            )
+            scaled_floor = self._active_contact_floor + convergence_ratio * (1.0 - self._active_contact_floor)
+            collision_evidence = max(collision_evidence, scaled_floor)
         elif collision_score.closing_speed_px_per_frame >= self._closing_speed_threshold:
             # Not (yet) sustained contact, but the gap is shrinking
             # meaningfully faster than the "just driving near each other"

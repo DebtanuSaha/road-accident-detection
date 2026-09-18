@@ -128,6 +128,7 @@ class _PairWindow:
     last_distance_frame: Optional[int] = None
     consecutive_overlap_frames: int = 0
     smoothed_closing_speed: float = 0.0
+    peak_closing_speed: float = 0.0  # highest smoothed closing speed EVER seen for this pair
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ class CollisionScore:
     is_sustained_contact: bool  # pair remains in contact via the looser SUSTAIN thresholds (collision aftermath)
     overlap_streak_frames: int  # consecutive frames of real overlap (carried through the grace window)
     closing_speed_px_per_frame: float  # SMOOTHED rate the pair's center distance is SHRINKING; 0 if not fresh this frame
+    peak_closing_speed_px_per_frame: float  # highest smoothed closing speed EVER observed for this pair (persists)
     in_post_interaction_window: bool  # still within the grace window after a past contact
 
     def to_dict(self) -> dict:
@@ -169,6 +171,7 @@ class CollisionScore:
             "is_sustained_contact": self.is_sustained_contact,
             "overlap_streak_frames": self.overlap_streak_frames,
             "closing_speed_px_per_frame": round(self.closing_speed_px_per_frame, 3),
+            "peak_closing_speed_px_per_frame": round(self.peak_closing_speed_px_per_frame, 3),
             "in_post_interaction_window": self.in_post_interaction_window,
         }
 
@@ -234,6 +237,8 @@ class CollisionScorer:
             smoothed_closing_speed = (
                 _CLOSING_SPEED_EMA_ALPHA * closing_speed_raw + (1 - _CLOSING_SPEED_EMA_ALPHA) * prev_smoothed
             )
+            prev_peak_closing_speed = existing.peak_closing_speed if existing is not None else 0.0
+            peak_closing_speed = max(prev_peak_closing_speed, smoothed_closing_speed)
 
             if interaction.is_overlapping:
                 prev_streak = existing.consecutive_overlap_frames if existing is not None else 0
@@ -253,6 +258,7 @@ class CollisionScorer:
                 last_distance_frame=frame_index,
                 consecutive_overlap_frames=overlap_streak,
                 smoothed_closing_speed=smoothed_closing_speed,
+                peak_closing_speed=peak_closing_speed,
             )
 
         # 2) Every pair still within its post-interaction window gets scored
@@ -320,6 +326,7 @@ class CollisionScorer:
                 is_sustained_contact=(interaction.is_sustained_contact if interaction is not None else False),
                 overlap_streak_frames=window.consecutive_overlap_frames,
                 closing_speed_px_per_frame=closing_speed,
+                peak_closing_speed_px_per_frame=window.peak_closing_speed,
                 in_post_interaction_window=True,
             )
             scores.append(score)

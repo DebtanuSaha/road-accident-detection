@@ -285,7 +285,7 @@ def test_collision_score_to_dict_schema(cfg):
         "trajectory_change_score", "motion_change_score", "post_interaction_stopping_score",
         "composite_score", "is_active_spatial_contact", "is_overlapping",
         "is_sustained_contact", "overlap_streak_frames", "closing_speed_px_per_frame",
-        "in_post_interaction_window",
+        "peak_closing_speed_px_per_frame", "in_post_interaction_window",
     }
     assert set(d.keys()) == expected_keys
 
